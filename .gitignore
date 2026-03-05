@@ -1,0 +1,6 @@
+.ruff_cache/
+.mypy_cache/
+.venv/
+.env
+.DS_Store
+.claude/
