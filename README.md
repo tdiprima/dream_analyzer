@@ -33,6 +33,4 @@ The app will open at http://localhost:8501 automatically.
 - Structured JSON response from the model so each section is cleanly separated
 - API key read from `OPENAI_API_KEY` env var — never hardcoded
 
-Note: Try gpt-5.2 or gpt-4o.
-
 <br>
