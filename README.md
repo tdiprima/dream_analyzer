@@ -25,10 +25,10 @@ The app will open at http://localhost:8501 automatically.
 - Large comfortable textarea with a gentle placeholder prompt
 - Single "Explore this dream" button
 - Four analysis cards returned from GPT-5.2:
-- Psychological Insights — Jungian/cognitive themes
-- Symbol Interpretation — archetypal imagery
-- Emotional Understanding — feelings and what they signal
-- Personal Growth Guidance — reflective questions to sit with
+  - Psychological Insights — Jungian/cognitive themes
+  - Symbol Interpretation — archetypal imagery
+  - Emotional Understanding — feelings and what they signal
+  - Personal Growth Guidance — reflective questions to sit with
 - Warm, non-clinical tone throughout
 - Structured JSON response from the model so each section is cleanly separated
 - API key read from `OPENAI_API_KEY` env var — never hardcoded
