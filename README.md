@@ -1,4 +1,4 @@
-# Dream Analyzer 🌙 ☁️ 
+# Dream Analyzer 🌙 ☁ 
 
 The dream interpreter in [Anthropic](https://claude.ai/artifacts/inspiration/be6430eb-3710-447c-a8b6-da40792ed790) stopped working, so I did what any reasonable person would do and built my own. DIY subconscious tech support.
 
