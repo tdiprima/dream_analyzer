@@ -1,13 +1,19 @@
+"""Streamlit adapter: page layout, client identity lookup, and rendering.
+
+All workflow logic lives in ``submission`` and ``dream_analysis``; this file only
+reads the request context, calls the workflow, and draws the result.
+"""
+
 import html
-import json
 import logging
-import os
 
 import streamlit as st
-from openai import OpenAI
 
 from abuse_settings import AbuseSettingsError, load_abuse_settings
-from rate_limiter import RateLimitDecision, SlidingWindowRateLimiter
+from client_identity import ClientIdentityError, resolve_client_key
+from dream_analysis import MAX_DREAM_CHARS, DreamAnalyzer, create_openai_client
+from rate_limiter import SlidingWindowRateLimiter
+from submission import SubmissionOutcome, SubmissionStatus, submit_dream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,14 +23,18 @@ logger = logging.getLogger(__name__)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
-MIN_DREAM_CHARS = 20
-MAX_DREAM_CHARS = 5000
-
 # Fail at startup on bad abuse-control config rather than on the first request.
 try:
     ABUSE_SETTINGS = load_abuse_settings()
 except AbuseSettingsError as exc:
     logger.error("Invalid abuse-control configuration: %s", exc)
+    raise SystemExit(f"Configuration error: {exc}") from exc
+
+# Missing credentials are a startup failure, not a first-request surprise.
+try:
+    OPENAI_CLIENT = create_openai_client()
+except EnvironmentError as exc:
+    logger.error("Missing credentials: %s", exc)
     raise SystemExit(f"Configuration error: {exc}") from exc
 
 
@@ -38,21 +48,19 @@ def get_rate_limiter() -> SlidingWindowRateLimiter:
     )
 
 
+@st.cache_resource
+def get_analyzer() -> DreamAnalyzer:
+    """One analyzer (and OpenAI client) per server process."""
+    return DreamAnalyzer(OPENAI_CLIENT, ABUSE_SETTINGS.max_output_tokens)
+
+
 def get_client_key() -> str:
-    """Identify the requesting client. Localhost has no IP, so fall back to a fixed key."""
-    ip_address = st.context.ip_address
-    return ip_address if ip_address else "local"
-
-
-def check_rate_limit() -> RateLimitDecision:
-    """Server-side gate for analysis requests. UI state is not an enforcement boundary."""
-    decision = get_rate_limiter().check_and_record(get_client_key())
-    if not decision.allowed:
-        logger.warning(
-            "Analysis request rate-limited",
-            extra={"event": "rate_limited", "component": "rate_limiter", "reason": decision.reason},
-        )
-    return decision
+    """Identity for rate limiting, resolved from the deployment-configured source."""
+    return resolve_client_key(
+        st.context.ip_address,
+        st.context.headers,
+        ABUSE_SETTINGS.client_id_header,
+    )
 
 st.set_page_config(
     page_title="Dream Journal & Analyzer",
@@ -187,148 +195,12 @@ with col_right:
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a compassionate and insightful dream analyst with deep knowledge of
-Jungian psychology, symbolic archetypes, and cognitive-emotional processing during sleep.
-
-When a user shares their dream, provide a warm, supportive analysis structured in exactly
-four sections. Use plain prose (no markdown headers or bullets inside the sections themselves):
-
-1. PSYCHOLOGICAL_INSIGHTS
-   Explore underlying psychological themes, unconscious processes, or unresolved tensions
-   that the dream may be reflecting. Ground observations in established psychology.
-
-2. SYMBOL_INTERPRETATION
-   Identify the key symbols, images, or characters in the dream and explain their common
-   archetypal meanings as well as how they may relate to the dreamer's inner world.
-
-3. EMOTIONAL_UNDERSTANDING
-   Reflect on the emotional texture of the dream — what feelings arose, what they might
-   signal about the dreamer's current emotional state, and what needs they may express.
-
-4. PERSONAL_GROWTH_GUIDANCE
-   Offer gentle, actionable reflections or questions the dreamer might sit with to use
-   this dream as a doorway for self-awareness and growth.
-
-Respond with exactly this JSON structure (no other text):
-{
-  "psychological_insights": "...",
-  "symbol_interpretation": "...",
-  "emotional_understanding": "...",
-  "personal_growth_guidance": "..."
-}
-
-Tone: warm, non-prescriptive, curious, never alarming. Treat the dreamer with care."""
-
-
-REQUIRED_SECTIONS = (
-    "psychological_insights",
-    "symbol_interpretation",
-    "emotional_understanding",
-    "personal_growth_guidance",
-)
-
-# Strict schema: the model must return exactly these four non-empty string fields.
-ANALYSIS_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "dream_analysis",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {key: {"type": "string"} for key in REQUIRED_SECTIONS},
-            "required": list(REQUIRED_SECTIONS),
-            "additionalProperties": False,
-        },
-    },
-}
-
-
-class ModelRefusalError(Exception):
-    """The model declined to analyze the dream."""
-
-
-class AnalysisFormatError(Exception):
-    """The model response did not match the four-section contract."""
-
-
-def get_openai_client() -> OpenAI:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "OPENAI_API_KEY environment variable is not set."
-        )
-    return OpenAI(api_key=api_key)
-
-
-def validate_dream_length(dream: str) -> None:
-    if len(dream) > MAX_DREAM_CHARS:
-        raise ValueError(
-            f"Dream description exceeds {MAX_DREAM_CHARS} characters."
-        )
-
-
-def extract_message_content(message) -> str:
-    """Return the text content, or raise if the model refused or returned nothing."""
-    refusal = getattr(message, "refusal", None)
-    if refusal:
-        logger.warning("Model refused analysis", extra={"event": "model_refusal", "component": "openai"})
-        raise ModelRefusalError(refusal)
-    if not message.content:
-        raise AnalysisFormatError("Model returned empty content.")
-    return message.content
-
-
-def validate_analysis(result: object) -> dict:
-    """Ensure every required section is present and a non-empty string."""
-    if not isinstance(result, dict):
-        raise AnalysisFormatError("Analysis is not a JSON object.")
-    missing = [
-        key for key in REQUIRED_SECTIONS
-        if not isinstance(result.get(key), str) or not result[key].strip()
-    ]
-    if missing:
-        raise AnalysisFormatError(f"Analysis missing sections: {', '.join(missing)}")
-    return result
-
-
-def analyze_dream(dream: str) -> dict:
-    cleaned = dream.strip()
-    validate_dream_length(cleaned)
-    client = get_openai_client()
-    logger.info("Sending dream for analysis", extra={"event": "analyze_dream", "component": "openai"})
-    response = client.chat.completions.create(
-        model="gpt-5.2",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": cleaned},
-        ],
-        response_format=ANALYSIS_RESPONSE_FORMAT,
-        temperature=0.75,
-        max_completion_tokens=ABUSE_SETTINGS.max_output_tokens,
-    )
-    content = extract_message_content(response.choices[0].message)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise AnalysisFormatError("Model returned invalid JSON.") from exc
-    result = validate_analysis(parsed)
-    logger.info("Received analysis", extra={"event": "analysis_received", "status": "ok"})
-    return result
-
-
 SECTION_META = [
     ("psychological_insights",  "Psychological Insights",   "&#129504;"),
     ("symbol_interpretation",   "Symbol Interpretation",    "&#10024;"),
     ("emotional_understanding", "Emotional Understanding",  "&#129293;"),
     ("personal_growth_guidance","Personal Growth Guidance", "&#127807;"),
 ]
-
-
-def rate_limit_message(decision: RateLimitDecision) -> str:
-    wait_seconds = max(1, int(decision.retry_after_seconds + 0.999))
-    if decision.reason == "global_limit":
-        return f"The analyst is busy right now. Please try again in about {wait_seconds} seconds."
-    return f"You've explored several dreams recently. Please wait about {wait_seconds} seconds."
 
 
 def render_analysis(result: dict) -> None:
@@ -346,54 +218,56 @@ def render_analysis(result: dict) -> None:
         )
 
 
-def run_analysis(cleaned: str) -> None:
-    """Call the model and render the result, mapping every failure to a safe message."""
+def render_success(analysis: dict) -> None:
+    st.markdown("---")
+    st.markdown(
+        "<h3 style='color:#c3b1e1; text-align:center; "
+        "margin-bottom:1.2rem;'>Your Dream Analysis</h3>",
+        unsafe_allow_html=True,
+    )
+    render_analysis(analysis)
+    st.markdown(
+        "<p style='color:#6e6487; font-size:0.8rem; text-align:center; "
+        "margin-top:1.5rem;'>This analysis is a reflective tool, not a "
+        "clinical diagnosis. Trust your own inner knowing.</p>",
+        unsafe_allow_html=True,
+    )
+
+
+# Which Streamlit widget shows each non-success outcome.
+OUTCOME_WIDGETS = {
+    SubmissionStatus.INVALID_INPUT: st.warning,
+    SubmissionStatus.RATE_LIMITED: st.warning,
+    SubmissionStatus.MODEL_REFUSED: st.info,
+    SubmissionStatus.BAD_RESPONSE: st.error,
+    SubmissionStatus.CONFIGURATION_ERROR: st.error,
+    SubmissionStatus.FAILED: st.error,
+}
+
+
+def render_outcome(outcome: SubmissionOutcome) -> None:
+    if outcome.is_success:
+        render_success(outcome.analysis)
+        return
+    OUTCOME_WIDGETS[outcome.status](outcome.message)
+
+
+def handle_submission(raw_text: str) -> None:
+    """Resolve the client, run the workflow, and draw whatever came back."""
+    try:
+        client_key = get_client_key()
+    except ClientIdentityError as exc:
+        # Fail closed: a misconfigured proxy must not grant an unlimited shared allowance.
+        logger.error("Client identity error: %s", exc, extra={"event": "client_identity_error"})
+        st.error("This request could not be identified. Please try again later.")
+        return
     with st.spinner("Gently exploring the threads of your dream..."):
-        try:
-            result = analyze_dream(cleaned)
-            st.markdown("---")
-            st.markdown(
-                "<h3 style='color:#c3b1e1; text-align:center; "
-                "margin-bottom:1.2rem;'>Your Dream Analysis</h3>",
-                unsafe_allow_html=True,
-            )
-            render_analysis(result)
-            st.markdown(
-                "<p style='color:#6e6487; font-size:0.8rem; text-align:center; "
-                "margin-top:1.5rem;'>This analysis is a reflective tool, not a "
-                "clinical diagnosis. Trust your own inner knowing.</p>",
-                unsafe_allow_html=True,
-            )
-        except EnvironmentError as exc:
-            st.error(str(exc))
-            logger.error("Configuration error: %s", exc)
-        except ModelRefusalError:
-            st.info(
-                "The analyst was unable to explore this dream. "
-                "Try rephrasing or sharing a different part of it."
-            )
-        except AnalysisFormatError as exc:
-            st.error("The analysis came back incomplete. Please try again.")
-            logger.error("Analysis format error: %s", exc)
-        except Exception as exc:
-            st.error("Something went wrong during analysis. Please try again.")
-            logger.error("Analysis failed: %s", exc, exc_info=True)
+        outcome = submit_dream(raw_text, client_key, get_rate_limiter(), get_analyzer())
+    render_outcome(outcome)
 
 
 if analyze_btn:
-    cleaned = dream_text.strip()
-    if not cleaned:
-        st.warning("Please describe your dream before exploring it.")
-    elif len(cleaned) < MIN_DREAM_CHARS:
-        st.warning("Add a bit more detail so the analysis can be meaningful.")
-    elif len(cleaned) > MAX_DREAM_CHARS:
-        st.warning(f"Please keep your dream under {MAX_DREAM_CHARS:,} characters.")
-    else:
-        rate_limit_decision = check_rate_limit()
-        if rate_limit_decision.allowed:
-            run_analysis(cleaned)
-        else:
-            st.warning(rate_limit_message(rate_limit_decision))
+    handle_submission(dream_text)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 

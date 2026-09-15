@@ -64,3 +64,18 @@ class ParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientIdHeaderTests(unittest.TestCase):
+    def test_unset_or_blank_means_none(self):
+        self.assertIsNone(load_abuse_settings({}).client_id_header)
+        self.assertIsNone(load_abuse_settings({"CLIENT_ID_HEADER": "  "}).client_id_header)
+
+    def test_valid_name_is_kept_trimmed(self):
+        settings = load_abuse_settings({"CLIENT_ID_HEADER": " X-Forwarded-For "})
+        self.assertEqual(settings.client_id_header, "X-Forwarded-For")
+
+    def test_invalid_name_rejected(self):
+        for bad in ("X Forwarded", "X:Y", "a\r\nb", "ü", "x" * 101):
+            with self.assertRaises(AbuseSettingsError):
+                load_abuse_settings({"CLIENT_ID_HEADER": bad})

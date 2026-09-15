@@ -32,14 +32,30 @@ at startup.
 | `RATE_LIMIT_GLOBAL` | `60` | Max analyses across all clients per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window length |
 | `ANALYSIS_MAX_OUTPUT_TOKENS` | `1500` | Ceiling on model output tokens per request (hard max 8000) |
+| `CLIENT_ID_HEADER` | unset | Header a trusted reverse proxy sets with the real client address (e.g. `X-Forwarded-For`) |
 
 Notes:
 
-- Limits are per server process. Run one process, or put a shared limiter (e.g. at the
-  reverse proxy) in front if you scale out.
-- Client IP comes from the connection. Behind a reverse proxy every user may share the
-  proxy's IP, so the per-client cap then applies to everyone; the global cap still holds.
-  Prefer rate limiting at the proxy as well for public deployments.
+- Limits are per server process and reset on restart. They are a defensive layer, not a
+  deployment-wide spend ceiling. If you run more than one replica, or need a hard cost
+  cap, enforce the limit at the reverse proxy or in a shared store as well.
+- Client identity defaults to the connection address. Behind a reverse proxy every user
+  would share the proxy's IP, so set `CLIENT_ID_HEADER` to the header your proxy sets.
+  The last comma-separated entry is used (the one your proxy appended), and a request
+  without a valid header is rejected. Only set this when a single trusted proxy sits in
+  front of the app and overwrites or appends that header; otherwise clients can spoof it.
+- `OPENAI_API_KEY` is required and checked at startup.
+
+## Layout
+
+| File | Responsibility |
+|---|---|
+| `app.py` | Streamlit adapter: layout, request context, rendering |
+| `submission.py` | Workflow: validate, rate-limit, analyze, map failures to safe outcomes |
+| `dream_analysis.py` | OpenAI request, prompt/schema contract, input and response validation |
+| `client_identity.py` | Resolve the rate-limit key from connection address or trusted header |
+| `rate_limiter.py` | Thread-safe sliding-window limiter (per client and global) |
+| `abuse_settings.py` | Environment-driven limits, validated at startup |
 
 ## What you get:
 

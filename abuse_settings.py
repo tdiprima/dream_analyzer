@@ -5,8 +5,9 @@ deployment fails at startup, not on the first request.
 """
 
 import os
+import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Optional
 
 DEFAULT_PER_CLIENT_LIMIT = 5
 DEFAULT_GLOBAL_LIMIT = 60
@@ -15,6 +16,9 @@ DEFAULT_MAX_OUTPUT_TOKENS = 1500
 
 # Hard ceiling regardless of configuration; four prose sections never need more.
 MAX_ALLOWED_OUTPUT_TOKENS = 8000
+
+# RFC 7230 header-name token characters.
+_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,100}$")
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,9 @@ class AbuseSettings:
     global_limit: int
     window_seconds: int
     max_output_tokens: int
+    # Header set by a trusted reverse proxy that identifies the real client.
+    # None means "use the connection address" (single-process, no proxy).
+    client_id_header: Optional[str]
 
 
 class AbuseSettingsError(ValueError):
@@ -44,6 +51,16 @@ def _read_positive_int(env: Mapping[str, str], name: str, default: int, maximum:
     return value
 
 
+def _read_header_name(env: Mapping[str, str], name: str) -> Optional[str]:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    value = raw.strip()
+    if not _HEADER_NAME.match(value):
+        raise AbuseSettingsError(f"{name} must be a valid HTTP header name, got {raw!r}")
+    return value
+
+
 def load_abuse_settings(env: Mapping[str, str] = os.environ) -> AbuseSettings:
     """Parse and validate abuse-control settings from ``env``."""
     settings = AbuseSettings(
@@ -53,6 +70,7 @@ def load_abuse_settings(env: Mapping[str, str] = os.environ) -> AbuseSettings:
         max_output_tokens=_read_positive_int(
             env, "ANALYSIS_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, MAX_ALLOWED_OUTPUT_TOKENS
         ),
+        client_id_header=_read_header_name(env, "CLIENT_ID_HEADER"),
     )
     if settings.per_client_limit > settings.global_limit:
         raise AbuseSettingsError(
