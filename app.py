@@ -6,6 +6,9 @@ import os
 import streamlit as st
 from openai import OpenAI
 
+from abuse_settings import AbuseSettingsError, load_abuse_settings
+from rate_limiter import RateLimitDecision, SlidingWindowRateLimiter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -16,6 +19,40 @@ logger = logging.getLogger(__name__)
 
 MIN_DREAM_CHARS = 20
 MAX_DREAM_CHARS = 5000
+
+# Fail at startup on bad abuse-control config rather than on the first request.
+try:
+    ABUSE_SETTINGS = load_abuse_settings()
+except AbuseSettingsError as exc:
+    logger.error("Invalid abuse-control configuration: %s", exc)
+    raise SystemExit(f"Configuration error: {exc}") from exc
+
+
+@st.cache_resource
+def get_rate_limiter() -> SlidingWindowRateLimiter:
+    """One limiter per server process, shared across all sessions and reruns."""
+    return SlidingWindowRateLimiter(
+        per_client_limit=ABUSE_SETTINGS.per_client_limit,
+        global_limit=ABUSE_SETTINGS.global_limit,
+        window_seconds=ABUSE_SETTINGS.window_seconds,
+    )
+
+
+def get_client_key() -> str:
+    """Identify the requesting client. Localhost has no IP, so fall back to a fixed key."""
+    ip_address = st.context.ip_address
+    return ip_address if ip_address else "local"
+
+
+def check_rate_limit() -> RateLimitDecision:
+    """Server-side gate for analysis requests. UI state is not an enforcement boundary."""
+    decision = get_rate_limiter().check_and_record(get_client_key())
+    if not decision.allowed:
+        logger.warning(
+            "Analysis request rate-limited",
+            extra={"event": "rate_limited", "component": "rate_limiter", "reason": decision.reason},
+        )
+    return decision
 
 st.set_page_config(
     page_title="Dream Journal & Analyzer",
@@ -267,6 +304,7 @@ def analyze_dream(dream: str) -> dict:
         ],
         response_format=ANALYSIS_RESPONSE_FORMAT,
         temperature=0.75,
+        max_completion_tokens=ABUSE_SETTINGS.max_output_tokens,
     )
     content = extract_message_content(response.choices[0].message)
     try:
@@ -286,6 +324,13 @@ SECTION_META = [
 ]
 
 
+def rate_limit_message(decision: RateLimitDecision) -> str:
+    wait_seconds = max(1, int(decision.retry_after_seconds + 0.999))
+    if decision.reason == "global_limit":
+        return f"The analyst is busy right now. Please try again in about {wait_seconds} seconds."
+    return f"You've explored several dreams recently. Please wait about {wait_seconds} seconds."
+
+
 def render_analysis(result: dict) -> None:
     for key, title, icon in SECTION_META:
         # Model prose is untrusted; escape it so it cannot become markup.
@@ -301,6 +346,40 @@ def render_analysis(result: dict) -> None:
         )
 
 
+def run_analysis(cleaned: str) -> None:
+    """Call the model and render the result, mapping every failure to a safe message."""
+    with st.spinner("Gently exploring the threads of your dream..."):
+        try:
+            result = analyze_dream(cleaned)
+            st.markdown("---")
+            st.markdown(
+                "<h3 style='color:#c3b1e1; text-align:center; "
+                "margin-bottom:1.2rem;'>Your Dream Analysis</h3>",
+                unsafe_allow_html=True,
+            )
+            render_analysis(result)
+            st.markdown(
+                "<p style='color:#6e6487; font-size:0.8rem; text-align:center; "
+                "margin-top:1.5rem;'>This analysis is a reflective tool, not a "
+                "clinical diagnosis. Trust your own inner knowing.</p>",
+                unsafe_allow_html=True,
+            )
+        except EnvironmentError as exc:
+            st.error(str(exc))
+            logger.error("Configuration error: %s", exc)
+        except ModelRefusalError:
+            st.info(
+                "The analyst was unable to explore this dream. "
+                "Try rephrasing or sharing a different part of it."
+            )
+        except AnalysisFormatError as exc:
+            st.error("The analysis came back incomplete. Please try again.")
+            logger.error("Analysis format error: %s", exc)
+        except Exception as exc:
+            st.error("Something went wrong during analysis. Please try again.")
+            logger.error("Analysis failed: %s", exc, exc_info=True)
+
+
 if analyze_btn:
     cleaned = dream_text.strip()
     if not cleaned:
@@ -310,36 +389,11 @@ if analyze_btn:
     elif len(cleaned) > MAX_DREAM_CHARS:
         st.warning(f"Please keep your dream under {MAX_DREAM_CHARS:,} characters.")
     else:
-        with st.spinner("Gently exploring the threads of your dream..."):
-            try:
-                result = analyze_dream(cleaned)
-                st.markdown("---")
-                st.markdown(
-                    "<h3 style='color:#c3b1e1; text-align:center; "
-                    "margin-bottom:1.2rem;'>Your Dream Analysis</h3>",
-                    unsafe_allow_html=True,
-                )
-                render_analysis(result)
-                st.markdown(
-                    "<p style='color:#6e6487; font-size:0.8rem; text-align:center; "
-                    "margin-top:1.5rem;'>This analysis is a reflective tool, not a "
-                    "clinical diagnosis. Trust your own inner knowing.</p>",
-                    unsafe_allow_html=True,
-                )
-            except EnvironmentError as exc:
-                st.error(str(exc))
-                logger.error("Configuration error: %s", exc)
-            except ModelRefusalError:
-                st.info(
-                    "The analyst was unable to explore this dream. "
-                    "Try rephrasing or sharing a different part of it."
-                )
-            except AnalysisFormatError as exc:
-                st.error("The analysis came back incomplete. Please try again.")
-                logger.error("Analysis format error: %s", exc)
-            except Exception as exc:
-                st.error("Something went wrong during analysis. Please try again.")
-                logger.error("Analysis failed: %s", exc, exc_info=True)
+        rate_limit_decision = check_rate_limit()
+        if rate_limit_decision.allowed:
+            run_analysis(cleaned)
+        else:
+            st.warning(rate_limit_message(rate_limit_decision))
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 
