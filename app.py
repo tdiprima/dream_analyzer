@@ -1,3 +1,5 @@
+import html
+import json
 import logging
 import os
 
@@ -11,6 +13,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Page config ──────────────────────────────────────────────────────────────
+
+MIN_DREAM_CHARS = 20
+MAX_DREAM_CHARS = 5000
 
 st.set_page_config(
     page_title="Dream Journal & Analyzer",
@@ -129,6 +134,7 @@ dream_text = st.text_area(
         "I felt a mixture of awe and gentle sadness..."
     ),
     height=220,
+    max_chars=MAX_DREAM_CHARS,
     label_visibility="collapsed",
 )
 
@@ -177,6 +183,37 @@ Respond with exactly this JSON structure (no other text):
 Tone: warm, non-prescriptive, curious, never alarming. Treat the dreamer with care."""
 
 
+REQUIRED_SECTIONS = (
+    "psychological_insights",
+    "symbol_interpretation",
+    "emotional_understanding",
+    "personal_growth_guidance",
+)
+
+# Strict schema: the model must return exactly these four non-empty string fields.
+ANALYSIS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "dream_analysis",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {key: {"type": "string"} for key in REQUIRED_SECTIONS},
+            "required": list(REQUIRED_SECTIONS),
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+class ModelRefusalError(Exception):
+    """The model declined to analyze the dream."""
+
+
+class AnalysisFormatError(Exception):
+    """The model response did not match the four-section contract."""
+
+
 def get_openai_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -186,22 +223,59 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def validate_dream_length(dream: str) -> None:
+    if len(dream) > MAX_DREAM_CHARS:
+        raise ValueError(
+            f"Dream description exceeds {MAX_DREAM_CHARS} characters."
+        )
+
+
+def extract_message_content(message) -> str:
+    """Return the text content, or raise if the model refused or returned nothing."""
+    refusal = getattr(message, "refusal", None)
+    if refusal:
+        logger.warning("Model refused analysis", extra={"event": "model_refusal", "component": "openai"})
+        raise ModelRefusalError(refusal)
+    if not message.content:
+        raise AnalysisFormatError("Model returned empty content.")
+    return message.content
+
+
+def validate_analysis(result: object) -> dict:
+    """Ensure every required section is present and a non-empty string."""
+    if not isinstance(result, dict):
+        raise AnalysisFormatError("Analysis is not a JSON object.")
+    missing = [
+        key for key in REQUIRED_SECTIONS
+        if not isinstance(result.get(key), str) or not result[key].strip()
+    ]
+    if missing:
+        raise AnalysisFormatError(f"Analysis missing sections: {', '.join(missing)}")
+    return result
+
+
 def analyze_dream(dream: str) -> dict:
+    cleaned = dream.strip()
+    validate_dream_length(cleaned)
     client = get_openai_client()
     logger.info("Sending dream for analysis", extra={"event": "analyze_dream", "component": "openai"})
     response = client.chat.completions.create(
         model="gpt-5.2",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": dream.strip()},
+            {"role": "user", "content": cleaned},
         ],
-        response_format={"type": "json_object"},
+        response_format=ANALYSIS_RESPONSE_FORMAT,
         temperature=0.75,
     )
-    import json
-    content = response.choices[0].message.content
+    content = extract_message_content(response.choices[0].message)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise AnalysisFormatError("Model returned invalid JSON.") from exc
+    result = validate_analysis(parsed)
     logger.info("Received analysis", extra={"event": "analysis_received", "status": "ok"})
-    return json.loads(content)
+    return result
 
 
 SECTION_META = [
@@ -214,14 +288,13 @@ SECTION_META = [
 
 def render_analysis(result: dict) -> None:
     for key, title, icon in SECTION_META:
-        text = result.get(key, "")
-        if not text:
-            continue
+        # Model prose is untrusted; escape it so it cannot become markup.
+        safe_text = html.escape(result[key])
         st.markdown(
             f"""
             <div class="dream-card">
               <h4>{icon}&nbsp; {title}</h4>
-              <p>{text}</p>
+              <p>{safe_text}</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -232,8 +305,10 @@ if analyze_btn:
     cleaned = dream_text.strip()
     if not cleaned:
         st.warning("Please describe your dream before exploring it.")
-    elif len(cleaned) < 20:
+    elif len(cleaned) < MIN_DREAM_CHARS:
         st.warning("Add a bit more detail so the analysis can be meaningful.")
+    elif len(cleaned) > MAX_DREAM_CHARS:
+        st.warning(f"Please keep your dream under {MAX_DREAM_CHARS:,} characters.")
     else:
         with st.spinner("Gently exploring the threads of your dream..."):
             try:
@@ -254,6 +329,14 @@ if analyze_btn:
             except EnvironmentError as exc:
                 st.error(str(exc))
                 logger.error("Configuration error: %s", exc)
+            except ModelRefusalError:
+                st.info(
+                    "The analyst was unable to explore this dream. "
+                    "Try rephrasing or sharing a different part of it."
+                )
+            except AnalysisFormatError as exc:
+                st.error("The analysis came back incomplete. Please try again.")
+                logger.error("Analysis format error: %s", exc)
             except Exception as exc:
                 st.error("Something went wrong during analysis. Please try again.")
                 logger.error("Analysis failed: %s", exc, exc_info=True)
